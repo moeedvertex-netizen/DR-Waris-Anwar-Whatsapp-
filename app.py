@@ -6,6 +6,10 @@ from flask import Flask, request, jsonify
 import requests as http_requests
 from supabase import create_client
 
+# Google Calendar imports
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -17,11 +21,90 @@ OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 AI_MODEL = os.environ.get("AI_MODEL", "openrouter/free")
+GOOGLE_CALENDAR_ID = os.environ.get("GOOGLE_CALENDAR_ID", "primary")
+GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON")  # Full JSON string as env var
 
 supabase = None
 if SUPABASE_URL and SUPABASE_KEY:
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
     logger.info("Supabase connected")
+
+# ── Google Calendar setup ────────────────────────────────────────────────────
+
+def get_calendar_service():
+    """Build a Google Calendar service using credentials from env var or file."""
+    try:
+        scopes = ["https://www.googleapis.com/auth/calendar"]
+
+        # Prefer env var (Railway secret), fall back to file on disk
+        if GOOGLE_CREDENTIALS_JSON:
+            creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
+        else:
+            creds_path = os.path.join(os.path.dirname(__file__), "google_credentials.json")
+            with open(creds_path) as f:
+                creds_dict = json.load(f)
+
+        creds = service_account.Credentials.from_service_account_info(creds_dict, scopes=scopes)
+        service = build("calendar", "v3", credentials=creds)
+        return service
+    except Exception as e:
+        logger.error(f"Google Calendar init error: {e}")
+        return None
+
+
+def add_to_google_calendar(customer_name, phone, service_name, apt_date, apt_time):
+    """
+    Create a Google Calendar event for a confirmed appointment.
+    apt_date: 'YYYY-MM-DD'
+    apt_time: 'HH:MM'  (24-hr)
+    Returns the created event dict, or None on failure.
+    """
+    try:
+        cal = get_calendar_service()
+        if not cal:
+            return None
+
+        # Build start datetime in Lahore timezone (PKT = UTC+5)
+        start_str = f"{apt_date}T{apt_time}:00"
+        # Appointments are 1 hour by default
+        start_dt = datetime.strptime(start_str, "%Y-%m-%dT%H:%M:%S")
+        end_dt = start_dt + timedelta(hours=1)
+        end_str = end_dt.strftime("%Y-%m-%dT%H:%M:%S")
+
+        event = {
+            "summary": f"Appointment – {customer_name} ({service_name})",
+            "location": "24-P Gulberg 2, Lahore",
+            "description": (
+                f"Patient: {customer_name}\n"
+                f"Phone: {phone}\n"
+                f"Service: {service_name}\n"
+                f"Booked via WhatsApp AI Receptionist"
+            ),
+            "start": {
+                "dateTime": start_str,
+                "timeZone": "Asia/Karachi",
+            },
+            "end": {
+                "dateTime": end_str,
+                "timeZone": "Asia/Karachi",
+            },
+            "reminders": {
+                "useDefault": False,
+                "overrides": [
+                    {"method": "email", "minutes": 60},
+                    {"method": "popup", "minutes": 30},
+                ],
+            },
+        }
+
+        created = cal.events().insert(calendarId=GOOGLE_CALENDAR_ID, body=event).execute()
+        logger.info(f"Google Calendar event created: {created.get('htmlLink')}")
+        return created
+    except Exception as e:
+        logger.error(f"Google Calendar insert error: {e}")
+        return None
+
+# ── System prompt ────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """You are a friendly and professional receptionist at Dr. Waris Anwar Aesthetics in Lahore, Pakistan.
 Your job is to warmly greet patients, share clinic information, help them find the right service, and book their appointment.
@@ -86,6 +169,8 @@ IMPORTANT RULES:
 
 conversations = {}
 
+# ── Database helpers ─────────────────────────────────────────────────────────
+
 def get_conversation_history(phone):
     if phone in conversations:
         return conversations[phone]
@@ -105,6 +190,7 @@ def get_conversation_history(phone):
             logger.error(f"Supabase read error: {e}")
     conversations[phone] = []
     return conversations[phone]
+
 
 def save_message_to_db(phone, name, text, sender_type):
     if not supabase:
@@ -137,8 +223,15 @@ def save_message_to_db(phone, name, text, sender_type):
         logger.error(f"Supabase save error: {e}")
         return None
 
+# ── AI helpers ───────────────────────────────────────────────────────────────
+
 def call_openrouter(messages, max_tokens=500, temperature=0.7):
-    models_to_try = ["openrouter/free", "openrouter/owl-alpha", "qwen/qwen3-coder:free", "nvidia/nemotron-3-super:free"]
+    models_to_try = [
+        "openrouter/free",
+        "openrouter/owl-alpha",
+        "qwen/qwen3-coder:free",
+        "nvidia/nemotron-3-super:free",
+    ]
     for model in models_to_try:
         try:
             response = http_requests.post(
@@ -147,15 +240,15 @@ def call_openrouter(messages, max_tokens=500, temperature=0.7):
                     "Authorization": f"Bearer {OPENROUTER_API_KEY}",
                     "Content-Type": "application/json",
                     "HTTP-Referer": "https://aesthetics.com.pk",
-                    "X-Title": "Dr Waris Anwar Aesthetics"
+                    "X-Title": "Dr Waris Anwar Aesthetics",
                 },
                 json={
                     "model": model,
                     "messages": messages,
                     "max_tokens": max_tokens,
-                    "temperature": temperature
+                    "temperature": temperature,
                 },
-                timeout=30
+                timeout=30,
             )
             data = response.json()
             if "choices" in data and len(data["choices"]) > 0:
@@ -165,48 +258,60 @@ def call_openrouter(messages, max_tokens=500, temperature=0.7):
                     return text
             if "error" in data:
                 logger.warning(f"Model {model} error: {data['error']}")
-                continue
         except Exception as e:
             logger.warning(f"Model {model} failed: {e}")
-            continue
     return None
+
 
 def get_ai_response(phone, message_text, sender_name):
     history = get_conversation_history(phone)
     history.append({"role": "user", "content": message_text})
-    
+
     today = datetime.now().strftime("%A, %d %B %Y")
-    messages = [{"role": "system", "content": SYSTEM_PROMPT + f"\n\nToday's date is {today}. Use this to understand when patient says 'tomorrow', 'next week', etc."}]
+    messages = [
+        {
+            "role": "system",
+            "content": SYSTEM_PROMPT
+            + f"\n\nToday's date is {today}. Use this to understand when patient says 'tomorrow', 'next week', etc.",
+        }
+    ]
     recent = history[-15:] if len(history) > 15 else history
     messages.extend(recent)
-    
+
     ai_text = call_openrouter(messages)
-    
+
     if not ai_text:
-        ai_text = "Thank you for contacting Dr. Waris Anwar Aesthetics. Please let me know which treatment you are interested in and I will be happy to help you book an appointment."
-    
+        ai_text = (
+            "Thank you for contacting Dr. Waris Anwar Aesthetics. "
+            "Please let me know which treatment you are interested in and I will be happy to help you book an appointment."
+        )
+
     history.append({"role": "assistant", "content": ai_text})
     conversations[phone] = history
     if len(conversations[phone]) > 30:
         conversations[phone] = conversations[phone][-20:]
-    
+
     save_message_to_db(phone, sender_name, message_text, "customer")
     save_message_to_db(phone, None, ai_text, "ai_agent")
     detect_appointment(history, phone)
-    
+
     return ai_text
+
+# ── Appointment detection + Google Calendar ──────────────────────────────────
 
 def detect_appointment(conversation_history, phone):
     try:
-        last_messages = conversation_history[-10:] if len(conversation_history) > 10 else conversation_history
+        last_messages = (
+            conversation_history[-10:] if len(conversation_history) > 10 else conversation_history
+        )
         conv_text = ""
         for msg in last_messages:
             role = "Patient" if msg["role"] == "user" else "Receptionist"
             conv_text += f"{role}: {msg['content']}\n"
-        
+
         today = datetime.now().strftime("%Y-%m-%d")
         tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
-        
+
         extraction_prompt = f"""Today's date is {today}. Tomorrow is {tomorrow}.
 
 Analyze this conversation. Was an appointment CONFIRMED with all details (name, service, date, time)?
@@ -214,7 +319,7 @@ If YES return JSON with ACTUAL dates (not placeholders):
 Example: {{"appointment_booked": true, "customer_name": "Ahmed", "service": "Hair Transplant", "date": "{tomorrow}", "time": "14:00"}}
 If NO return: {{"appointment_booked": false}}
 
-IMPORTANT: 
+IMPORTANT:
 - "tomorrow" means {tomorrow}
 - "today" means {today}
 - Date MUST be actual date like {tomorrow}, NOT "YYYY-MM-DD"
@@ -226,43 +331,88 @@ Conversation:
 
         result_text = call_openrouter(
             [{"role": "user", "content": extraction_prompt}],
-            max_tokens=200, temperature=0.1
+            max_tokens=200,
+            temperature=0.1,
         )
-        if result_text:
-            result_text = result_text.replace("```json", "").replace("```", "").strip()
-            result = json.loads(result_text)
-            if result.get("appointment_booked"):
-                apt_date = result.get("date", "")
-                apt_time = result.get("time", "")
-                
-                # Skip if date is still placeholder
-                if "YYYY" in apt_date or not apt_date or len(apt_date) != 10:
-                    logger.warning(f"Invalid date format: {apt_date}, skipping save")
-                    return
-                
-                logger.info(f"Appointment detected: {result}")
-                if supabase:
-                    conv_id = None
-                    conv = supabase.table("conversations").select("id").eq("customer_phone", phone).execute()
-                    if conv.data:
-                        conv_id = conv.data[0]["id"]
+        if not result_text:
+            return
+
+        result_text = result_text.replace("```json", "").replace("```", "").strip()
+        result = json.loads(result_text)
+
+        if not result.get("appointment_booked"):
+            return
+
+        apt_date = result.get("date", "")
+        apt_time = result.get("time", "")
+
+        # Skip if date is still a placeholder or malformed
+        if "YYYY" in apt_date or not apt_date or len(apt_date) != 10:
+            logger.warning(f"Invalid date format: {apt_date}, skipping save")
+            return
+
+        customer_name = result.get("customer_name", "Unknown")
+        service_name = result.get("service", "Consultation")
+
+        logger.info(f"Appointment detected: {result}")
+
+        # ── Save to Supabase ───────────────────────────────────────────────
+        conv_id = None
+        if supabase:
+            try:
+                conv = supabase.table("conversations").select("id").eq("customer_phone", phone).execute()
+                if conv.data:
+                    conv_id = conv.data[0]["id"]
+
+                # Avoid duplicate appointments (same phone + date + time)
+                existing = (
+                    supabase.table("appointments")
+                    .select("id")
+                    .eq("customer_phone", phone)
+                    .eq("appointment_date", apt_date)
+                    .eq("appointment_time", apt_time)
+                    .execute()
+                )
+                if existing.data:
+                    logger.info("Appointment already exists in DB, skipping duplicate insert.")
+                else:
                     supabase.table("appointments").insert({
                         "conversation_id": conv_id,
-                        "customer_name": result.get("customer_name", ""),
+                        "customer_name": customer_name,
                         "customer_phone": phone,
-                        "service": result.get("service", ""),
+                        "service": service_name,
                         "appointment_date": apt_date,
                         "appointment_time": apt_time,
-                        "status": "confirmed"
+                        "status": "confirmed",
                     }).execute()
-                    logger.info(f"Appointment saved to DB: {result.get('customer_name')} - {apt_date} {apt_time}")
+                    logger.info(f"Appointment saved to Supabase: {customer_name} – {apt_date} {apt_time}")
+            except Exception as e:
+                logger.error(f"Supabase appointment save error: {e}")
+
+        # ── Save to Google Calendar ────────────────────────────────────────
+        event = add_to_google_calendar(customer_name, phone, service_name, apt_date, apt_time)
+        if event:
+            logger.info(f"Google Calendar event created for {customer_name}: {event.get('htmlLink')}")
+        else:
+            logger.warning(f"Google Calendar event NOT created for {customer_name}")
+
     except Exception as e:
         logger.error(f"Appointment detection error: {e}")
 
+# ── WhatsApp ─────────────────────────────────────────────────────────────────
+
 def send_whatsapp_message(to, text):
     url = f"https://graph.facebook.com/v25.0/{PHONE_NUMBER_ID}/messages"
-    headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
-    data = {"messaging_product": "whatsapp", "to": to, "type": "text", "text": {"body": text}}
+    headers = {
+        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    data = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "text",
+        "text": {"body": text},
+    }
     try:
         response = http_requests.post(url, headers=headers, json=data, timeout=10)
         logger.info(f"WhatsApp send: {response.status_code}")
@@ -272,6 +422,8 @@ def send_whatsapp_message(to, text):
     except Exception as e:
         logger.error(f"WhatsApp send error: {e}")
         return False
+
+# ── Routes ───────────────────────────────────────────────────────────────────
 
 @app.route("/webhook", methods=["GET"])
 def verify_webhook():
@@ -283,6 +435,7 @@ def verify_webhook():
         return challenge, 200
     logger.warning(f"Webhook verification failed. Token: {token}")
     return "Forbidden", 403
+
 
 @app.route("/webhook", methods=["POST"])
 def handle_webhook():
@@ -307,14 +460,20 @@ def handle_webhook():
                             logger.info(f"Reply to {phone}: {ai_response[:100]}...")
                         elif message.get("type") in ["image", "audio", "video", "document"]:
                             phone = message["from"]
-                            send_whatsapp_message(phone, "Thank you for sharing that. For now I can only read text messages. Please type your query and I will be happy to help you.")
+                            send_whatsapp_message(
+                                phone,
+                                "Thank you for sharing that. For now I can only read text messages. "
+                                "Please type your query and I will be happy to help you.",
+                            )
     except Exception as e:
         logger.error(f"Webhook error: {e}")
     return jsonify({"status": "ok"}), 200
 
+
 @app.route("/", methods=["GET"])
 def health():
     return jsonify({"status": "running", "app": "Dr Waris Anwar Aesthetics", "model": AI_MODEL})
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
