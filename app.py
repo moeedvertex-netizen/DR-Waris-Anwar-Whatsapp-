@@ -1,5 +1,3 @@
-
-
 import os
 import json
 import logging
@@ -18,7 +16,7 @@ VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "drwaris_verify_token_2026")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
-AI_MODEL = os.environ.get("AI_MODEL", "google/gemma-3-27b-it:free")
+AI_MODEL = os.environ.get("AI_MODEL", "openrouter/free")
 
 supabase = None
 if SUPABASE_URL and SUPABASE_KEY:
@@ -140,7 +138,7 @@ def save_message_to_db(phone, name, text, sender_type):
         return None
 
 def call_openrouter(messages, max_tokens=500, temperature=0.7):
-    models_to_try = [AI_MODEL, "deepseek/deepseek-r1:free", "meta-llama/llama-3.3-70b-instruct:free"]
+    models_to_try = ["openrouter/free", "openrouter/owl-alpha", "qwen/qwen3-coder:free", "nvidia/nemotron-3-super:free"]
     for model in models_to_try:
         try:
             response = http_requests.post(
@@ -177,7 +175,8 @@ def get_ai_response(phone, message_text, sender_name):
     history = get_conversation_history(phone)
     history.append({"role": "user", "content": message_text})
     
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    today = datetime.now().strftime("%A, %d %B %Y")
+    messages = [{"role": "system", "content": SYSTEM_PROMPT + f"\n\nToday's date is {today}. Use this to understand when patient says 'tomorrow', 'next week', etc."}]
     recent = history[-15:] if len(history) > 15 else history
     messages.extend(recent)
     
@@ -205,20 +204,25 @@ def detect_appointment(conversation_history, phone):
             role = "Patient" if msg["role"] == "user" else "Receptionist"
             conv_text += f"{role}: {msg['content']}\n"
         
+        today = datetime.now().strftime("%Y-%m-%d")
+        tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+        
+        extraction_prompt = f"""Today's date is {today}. Tomorrow is {tomorrow}.
 
-        extraction_prompt = f"""Analyze this conversation. Was an appointment CONFIRMED with all details (name, service, date, time)?
-    If YES return JSON: {{"appointment_booked": true, "customer_name": "...", "service": "...", "date": "YYYY-MM-DD", "time": "HH:MM"}}
-    If NO return: {{"appointment_booked": false}}
+Analyze this conversation. Was an appointment CONFIRMED with all details (name, service, date, time)?
+If YES return JSON with ACTUAL dates (not placeholders):
+Example: {{"appointment_booked": true, "customer_name": "Ahmed", "service": "Hair Transplant", "date": "{tomorrow}", "time": "14:00"}}
+If NO return: {{"appointment_booked": false}}
 
-    IMPORTANT:
-    - If the date is described as 'tomorrow', return the actual date in YYYY-MM-DD format (e.g., '{(datetime.utcnow() + timedelta(days=1)).strftime('%Y-%m-%d')}').
-    - If the date is described as 'today', return today's date in YYYY-MM-DD format (e.g., '{datetime.utcnow().strftime('%Y-%m-%d')}').
-    - Never return 'YYYY-MM-DD' as the date. Always return a real date.
-    - Time must be in 24-hour format (HH:MM).
-    - Return ONLY JSON, nothing else.
+IMPORTANT: 
+- "tomorrow" means {tomorrow}
+- "today" means {today}
+- Date MUST be actual date like {tomorrow}, NOT "YYYY-MM-DD"
+- Time MUST be in 24hr format like "14:00"
+- Return ONLY valid JSON
 
-    Conversation:
-    {conv_text}"""
+Conversation:
+{conv_text}"""
 
         result_text = call_openrouter(
             [{"role": "user", "content": extraction_prompt}],
@@ -228,6 +232,14 @@ def detect_appointment(conversation_history, phone):
             result_text = result_text.replace("```json", "").replace("```", "").strip()
             result = json.loads(result_text)
             if result.get("appointment_booked"):
+                apt_date = result.get("date", "")
+                apt_time = result.get("time", "")
+                
+                # Skip if date is still placeholder
+                if "YYYY" in apt_date or not apt_date or len(apt_date) != 10:
+                    logger.warning(f"Invalid date format: {apt_date}, skipping save")
+                    return
+                
                 logger.info(f"Appointment detected: {result}")
                 if supabase:
                     conv_id = None
@@ -239,10 +251,11 @@ def detect_appointment(conversation_history, phone):
                         "customer_name": result.get("customer_name", ""),
                         "customer_phone": phone,
                         "service": result.get("service", ""),
-                        "appointment_date": result.get("date", ""),
-                        "appointment_time": result.get("time", ""),
+                        "appointment_date": apt_date,
+                        "appointment_time": apt_time,
                         "status": "confirmed"
                     }).execute()
+                    logger.info(f"Appointment saved to DB: {result.get('customer_name')} - {apt_date} {apt_time}")
     except Exception as e:
         logger.error(f"Appointment detection error: {e}")
 
