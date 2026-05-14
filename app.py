@@ -1,60 +1,28 @@
 import os
 import json
-import re
 import logging
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
-import requests
+import requests as http_requests
 from supabase import create_client
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
 
-# AI Providers
-import google.generativeai as genai
-import openai
-
-# ============================================================
-# CONFIGURATION
-# ============================================================
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-
-# Environment Variables
 WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID")
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "drwaris_verify_token_2026")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
-AI_PROVIDER = os.environ.get("AI_PROVIDER", "gemini").lower()
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
-GOOGLE_CALENDAR_ID = os.environ.get("GOOGLE_CALENDAR_ID")
-GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
+AI_MODEL = os.environ.get("AI_MODEL", "google/gemma-3-27b-it:free")
 
-# Initialize Supabase
 supabase = None
 if SUPABASE_URL and SUPABASE_KEY:
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
     logger.info("Supabase connected")
 
-
-# Initialize AI Provider
-if AI_PROVIDER == "gemini":
-    genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel("gemini-2.0-flash")
-elif AI_PROVIDER == "openrouter":
-    openai.api_key = OPENROUTER_API_KEY
-    openai.base_url = "https://openrouter.ai/api/v1"
-    # You can change the model below to any OpenRouter-supported model
-    OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "mistralai/mistral-large-v2")
-else:
-    raise Exception("Invalid AI_PROVIDER. Use 'gemini' or 'openrouter'.")
-
-# ============================================================
-# SYSTEM PROMPT - DR. WARIS ANWAR AESTHETICS
-# ============================================================
 SYSTEM_PROMPT = """You are a friendly and professional receptionist at Dr. Waris Anwar Aesthetics in Lahore, Pakistan.
 Your job is to warmly greet patients, share clinic information, help them find the right service, and book their appointment.
 You NEVER say you are a bot, AI, virtual assistant, or automated system. You speak naturally like a real clinic receptionist. If someone asks if you are a bot or AI, politely deflect and redirect them to their query.
@@ -116,44 +84,33 @@ IMPORTANT RULES:
 - Always redirect conversation towards booking an appointment
 - Phone number is already available from WhatsApp, dont ask for it"""
 
-# ============================================================
-# CONVERSATION MEMORY (In-memory + Supabase)
-# ============================================================
-conversations = {}  # {phone_number: [{"role": "user/model", "parts": ["text"]}]}
+conversations = {}
 
 def get_conversation_history(phone):
-    """Get conversation history from memory or Supabase"""
     if phone in conversations:
         return conversations[phone]
-    
-    # Try loading from Supabase
     if supabase:
         try:
             conv = supabase.table("conversations").select("id").eq("customer_phone", phone).execute()
             if conv.data:
                 conv_id = conv.data[0]["id"]
-                msgs = supabase.table("messages").select("*").eq("conversation_id", conv_id).order("created_at").limit(30).execute()
+                msgs = supabase.table("messages").select("*").eq("conversation_id", conv_id).order("created_at").limit(20).execute()
                 history = []
                 for m in msgs.data:
-                    role = "user" if m["sender_type"] == "customer" else "model"
-                    history.append({"role": role, "parts": [m["message_text"]]})
+                    role = "user" if m["sender_type"] == "customer" else "assistant"
+                    history.append({"role": role, "content": m["message_text"]})
                 conversations[phone] = history
                 return history
         except Exception as e:
             logger.error(f"Supabase read error: {e}")
-    
     conversations[phone] = []
     return conversations[phone]
 
 def save_message_to_db(phone, name, text, sender_type):
-    """Save message to Supabase"""
     if not supabase:
         return None
-    
     try:
-        # Get or create conversation
         conv = supabase.table("conversations").select("id").eq("customer_phone", phone).execute()
-        
         if conv.data:
             conv_id = conv.data[0]["id"]
             supabase.table("conversations").update({
@@ -169,258 +126,124 @@ def save_message_to_db(phone, name, text, sender_type):
                 "unread_count": 0
             }).execute()
             conv_id = result.data[0]["id"]
-        
-        # Save message
         supabase.table("messages").insert({
             "conversation_id": conv_id,
             "sender_type": sender_type,
             "message_text": text,
             "message_type": "text"
         }).execute()
-        
-        # Increment unread if customer
-        if sender_type == "customer":
-            supabase.rpc("increment_unread", {"conv_id": conv_id}).execute()
-        
         return conv_id
     except Exception as e:
         logger.error(f"Supabase save error: {e}")
         return None
 
-# ============================================================
-# GOOGLE CALENDAR INTEGRATION
-# ============================================================
-def get_calendar_service():
-    """Initialize Google Calendar service"""
-    if not GOOGLE_SERVICE_ACCOUNT_JSON:
-        return None
-    try:
-        creds_dict = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
-        creds = service_account.Credentials.from_service_account_info(
-            creds_dict,
-            scopes=["https://www.googleapis.com/auth/calendar"]
-        )
-        service = build("calendar", "v3", credentials=creds)
-        return service
-    except Exception as e:
-        logger.error(f"Calendar service error: {e}")
-        return None
+def call_openrouter(messages, max_tokens=500, temperature=0.7):
+    models_to_try = [AI_MODEL, "deepseek/deepseek-r1:free", "meta-llama/llama-3.3-70b-instruct:free"]
+    for model in models_to_try:
+        try:
+            response = http_requests.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                    "Content-Type": "application/json",
+                    "HTTP-Referer": "https://aesthetics.com.pk",
+                    "X-Title": "Dr Waris Anwar Aesthetics"
+                },
+                json={
+                    "model": model,
+                    "messages": messages,
+                    "max_tokens": max_tokens,
+                    "temperature": temperature
+                },
+                timeout=30
+            )
+            data = response.json()
+            if "choices" in data and len(data["choices"]) > 0:
+                text = data["choices"][0]["message"]["content"].strip()
+                if text:
+                    logger.info(f"AI response from {model}: {text[:80]}...")
+                    return text
+            if "error" in data:
+                logger.warning(f"Model {model} error: {data['error']}")
+                continue
+        except Exception as e:
+            logger.warning(f"Model {model} failed: {e}")
+            continue
+    return None
 
-def create_calendar_event(name, phone, service_name, date_str, time_str):
-    """Create Google Calendar event for appointment"""
-    cal_service = get_calendar_service()
-    if not cal_service or not GOOGLE_CALENDAR_ID:
-        logger.warning("Google Calendar not configured, saving to DB only")
-        return None
+def get_ai_response(phone, message_text, sender_name):
+    history = get_conversation_history(phone)
+    history.append({"role": "user", "content": message_text})
     
-    try:
-        start_dt = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
-        end_dt = start_dt + timedelta(hours=1)
-        
-        event = {
-            "summary": f"{service_name} - {name}",
-            "description": f"Patient: {name}\nPhone: {phone}\nService: {service_name}\nBooked via WhatsApp AI Agent",
-            "start": {
-                "dateTime": start_dt.strftime("%Y-%m-%dT%H:%M:%S"),
-                "timeZone": "Asia/Karachi"
-            },
-            "end": {
-                "dateTime": end_dt.strftime("%Y-%m-%dT%H:%M:%S"),
-                "timeZone": "Asia/Karachi"
-            },
-            "location": "24-P Gulberg 2, Lahore",
-            "reminders": {
-                "useDefault": False,
-                "overrides": [
-                    {"method": "popup", "minutes": 60},
-                    {"method": "popup", "minutes": 15}
-                ]
-            }
-        }
-        
-        created = cal_service.events().insert(calendarId=GOOGLE_CALENDAR_ID, body=event).execute()
-        logger.info(f"Calendar event created: {created.get('id')}")
-        return created.get("id")
-    except Exception as e:
-        logger.error(f"Calendar create error: {e}")
-        return None
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    recent = history[-15:] if len(history) > 15 else history
+    messages.extend(recent)
+    
+    ai_text = call_openrouter(messages)
+    
+    if not ai_text:
+        ai_text = "Thank you for contacting Dr. Waris Anwar Aesthetics. Please let me know which treatment you are interested in and I will be happy to help you book an appointment."
+    
+    history.append({"role": "assistant", "content": ai_text})
+    conversations[phone] = history
+    if len(conversations[phone]) > 30:
+        conversations[phone] = conversations[phone][-20:]
+    
+    save_message_to_db(phone, sender_name, message_text, "customer")
+    save_message_to_db(phone, None, ai_text, "ai_agent")
+    detect_appointment(history, phone)
+    
+    return ai_text
 
-def save_appointment_to_db(phone, name, service_name, date_str, time_str, google_event_id=None, conv_id=None):
-    """Save appointment to Supabase"""
-    if not supabase:
-        return
-    try:
-        supabase.table("appointments").insert({
-            "conversation_id": conv_id,
-            "customer_name": name,
-            "customer_phone": phone,
-            "service": service_name,
-            "appointment_date": date_str,
-            "appointment_time": time_str,
-            "status": "confirmed",
-            "google_event_id": google_event_id
-        }).execute()
-        logger.info(f"Appointment saved: {name} - {service_name} - {date_str} {time_str}")
-    except Exception as e:
-        logger.error(f"Appointment save error: {e}")
-
-# ============================================================
-# APPOINTMENT DETECTION
-# ============================================================
 def detect_appointment(conversation_history, phone):
-    """Use Gemini to detect if appointment was booked"""
     try:
-        last_messages = conversation_history[-15:] if len(conversation_history) > 15 else conversation_history
-        
+        last_messages = conversation_history[-10:] if len(conversation_history) > 10 else conversation_history
         conv_text = ""
         for msg in last_messages:
             role = "Patient" if msg["role"] == "user" else "Receptionist"
-            conv_text += f"{role}: {msg['parts'][0]}\n"
+            conv_text += f"{role}: {msg['content']}\n"
         
-        extraction_prompt = f"""Analyze this WhatsApp conversation between a clinic receptionist and a patient. 
-Determine if an appointment has been CONFIRMED (meaning the receptionist confirmed a specific date, time, service and patient name).
+        extraction_prompt = f"""Analyze this conversation. Was an appointment CONFIRMED with all details (name, service, date, time)?
+If YES return JSON: {{"appointment_booked": true, "customer_name": "...", "service": "...", "date": "YYYY-MM-DD", "time": "HH:MM"}}
+If NO return: {{"appointment_booked": false}}
+Return ONLY JSON.
 
 Conversation:
-{conv_text}
+{conv_text}"""
 
-If an appointment was CONFIRMED, extract details in this EXACT JSON format:
-{{"appointment_booked": true, "customer_name": "...", "service": "...", "date": "YYYY-MM-DD", "time": "HH:MM"}}
-
-If NO appointment was confirmed yet, return:
-{{"appointment_booked": false}}
-
-IMPORTANT: 
-- Date must be in YYYY-MM-DD format
-- Time must be in HH:MM 24-hour format  
-- Only return true if ALL details (name, service, date, time) are clearly mentioned and confirmed
-- Return ONLY valid JSON, nothing else"""
-
-        response = model.generate_content(extraction_prompt)
-        result_text = response.text.strip()
-        
-        # Clean JSON
-        result_text = result_text.replace("```json", "").replace("```", "").strip()
-        
-        result = json.loads(result_text)
-        
-        if result.get("appointment_booked"):
-            logger.info(f"Appointment detected: {result}")
-            
-            # Create Google Calendar event
-            google_event_id = create_calendar_event(
-                result["customer_name"],
-                phone,
-                result["service"],
-                result["date"],
-                result["time"]
-            )
-            
-            # Save to database
-            conv_id = None
-            if supabase:
-                conv = supabase.table("conversations").select("id").eq("customer_phone", phone).execute()
-                if conv.data:
-                    conv_id = conv.data[0]["id"]
-            
-            save_appointment_to_db(
-                phone,
-                result["customer_name"],
-                result["service"],
-                result["date"],
-                result["time"],
-                google_event_id,
-                conv_id
-            )
-            
-            return result
-    except json.JSONDecodeError as e:
-        logger.error(f"JSON parse error in appointment detection: {e}")
+        result_text = call_openrouter(
+            [{"role": "user", "content": extraction_prompt}],
+            max_tokens=200, temperature=0.1
+        )
+        if result_text:
+            result_text = result_text.replace("```json", "").replace("```", "").strip()
+            result = json.loads(result_text)
+            if result.get("appointment_booked"):
+                logger.info(f"Appointment detected: {result}")
+                if supabase:
+                    conv_id = None
+                    conv = supabase.table("conversations").select("id").eq("customer_phone", phone).execute()
+                    if conv.data:
+                        conv_id = conv.data[0]["id"]
+                    supabase.table("appointments").insert({
+                        "conversation_id": conv_id,
+                        "customer_name": result.get("customer_name", ""),
+                        "customer_phone": phone,
+                        "service": result.get("service", ""),
+                        "appointment_date": result.get("date", ""),
+                        "appointment_time": result.get("time", ""),
+                        "status": "confirmed"
+                    }).execute()
     except Exception as e:
         logger.error(f"Appointment detection error: {e}")
-    
-    return None
 
-# ============================================================
-# GEMINI AI RESPONSE
-# ============================================================
-def get_ai_response(phone, message_text, sender_name):
-    """Get AI response from Gemini or OpenRouter"""
-    history = get_conversation_history(phone)
-    # Add user message to history
-    history.append({"role": "user", "parts": [message_text]})
-
-    try:
-        if AI_PROVIDER == "gemini":
-            chat = model.start_chat(history=history[:-1])
-            full_prompt = message_text
-            if len(history) <= 1:
-                full_prompt = f"[System: {SYSTEM_PROMPT}]\n\nPatient says: {message_text}"
-            response = chat.send_message(
-                full_prompt,
-                generation_config=genai.types.GenerationConfig(
-                    temperature=0.7,
-                    max_output_tokens=500
-                )
-            )
-            ai_text = response.text.strip()
-        elif AI_PROVIDER == "openrouter":
-            # OpenRouter expects history as [{'role': 'user'/'assistant', 'content': ...}]
-            or_history = []
-            for msg in history:
-                role = "user" if msg["role"] == "user" else "assistant"
-                or_history.append({"role": role, "content": msg["parts"][0]})
-            or_history.append({"role": "user", "content": message_text})
-            system_prompt = SYSTEM_PROMPT
-            completion = openai.chat.completions.create(
-                model=OPENROUTER_MODEL,
-                messages=[{"role": "system", "content": system_prompt}] + or_history,
-                max_tokens=500,
-                temperature=0.7
-            )
-            ai_text = completion.choices[0].message.content.strip()
-        else:
-            raise Exception("Invalid AI_PROVIDER")
-
-        # Add AI response to history
-        history.append({"role": "model", "parts": [ai_text]})
-        conversations[phone] = history
-
-        # Keep history manageable
-        if len(conversations[phone]) > 40:
-            conversations[phone] = conversations[phone][-30:]
-
-        # Save to database
-        save_message_to_db(phone, sender_name, message_text, "customer")
-        save_message_to_db(phone, None, ai_text, "ai_agent")
-
-        # Check for appointment
-        detect_appointment(history, phone)
-
-        return ai_text
-    except Exception as e:
-        logger.error(f"AI error: {e}")
-        return "Thank you for reaching out. Our team will get back to you shortly. You can also call us at our clinic number."
-
-# ============================================================
-# WHATSAPP API
-# ============================================================
 def send_whatsapp_message(to, text):
-    """Send message via WhatsApp Cloud API"""
     url = f"https://graph.facebook.com/v25.0/{PHONE_NUMBER_ID}/messages"
-    headers = {
-        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
-        "Content-Type": "application/json"
-    }
-    data = {
-        "messaging_product": "whatsapp",
-        "to": to,
-        "type": "text",
-        "text": {"body": text}
-    }
-    
+    headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
+    data = {"messaging_product": "whatsapp", "to": to, "type": "text", "text": {"body": text}}
     try:
-        response = requests.post(url, headers=headers, json=data)
-        logger.info(f"WhatsApp send response: {response.status_code}")
+        response = http_requests.post(url, headers=headers, json=data, timeout=10)
+        logger.info(f"WhatsApp send: {response.status_code}")
         if response.status_code != 200:
             logger.error(f"WhatsApp error: {response.text}")
         return response.status_code == 200
@@ -428,28 +251,20 @@ def send_whatsapp_message(to, text):
         logger.error(f"WhatsApp send error: {e}")
         return False
 
-# ============================================================
-# WEBHOOK ROUTES
-# ============================================================
 @app.route("/webhook", methods=["GET"])
 def verify_webhook():
-    """Webhook verification for Meta"""
     mode = request.args.get("hub.mode")
     token = request.args.get("hub.verify_token")
     challenge = request.args.get("hub.challenge")
-    
     if mode == "subscribe" and token == VERIFY_TOKEN:
         logger.info("Webhook verified!")
         return challenge, 200
-    
     logger.warning(f"Webhook verification failed. Token: {token}")
     return "Forbidden", 403
 
 @app.route("/webhook", methods=["POST"])
 def handle_webhook():
-    """Handle incoming WhatsApp messages"""
     data = request.get_json()
-    
     try:
         if data.get("object") == "whatsapp_business_account":
             for entry in data.get("entry", []):
@@ -457,55 +272,28 @@ def handle_webhook():
                     value = change.get("value", {})
                     messages = value.get("messages", [])
                     contacts = value.get("contacts", [])
-                    
                     for message in messages:
                         if message.get("type") == "text":
                             phone = message["from"]
                             text = message["text"]["body"]
-                            
-                            # Get sender name
                             sender_name = None
                             if contacts:
                                 sender_name = contacts[0].get("profile", {}).get("name")
-                            
                             logger.info(f"Message from {phone} ({sender_name}): {text}")
-                            
-                            # Get AI response
                             ai_response = get_ai_response(phone, text, sender_name)
-                            
-                            # Send reply
                             send_whatsapp_message(phone, ai_response)
-                            
                             logger.info(f"Reply to {phone}: {ai_response[:100]}...")
-                        
                         elif message.get("type") in ["image", "audio", "video", "document"]:
                             phone = message["from"]
-                            send_whatsapp_message(
-                                phone, 
-                                "Thank you for sharing that. For now I can only read text messages. Please type your query and I will be happy to help you."
-                            )
+                            send_whatsapp_message(phone, "Thank you for sharing that. For now I can only read text messages. Please type your query and I will be happy to help you.")
     except Exception as e:
-        logger.error(f"Webhook processing error: {e}")
-    
+        logger.error(f"Webhook error: {e}")
     return jsonify({"status": "ok"}), 200
 
-# ============================================================
-# HEALTH CHECK
-# ============================================================
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({
-        "status": "running",
-        "app": "Dr. Waris Anwar Aesthetics - WhatsApp AI Agent",
-        "whatsapp": "connected" if WHATSAPP_TOKEN else "not configured",
-        "gemini": "connected" if GEMINI_API_KEY else "not configured",
-        "supabase": "connected" if supabase else "not configured",
-        "calendar": "connected" if GOOGLE_SERVICE_ACCOUNT_JSON else "not configured"
-    })
+    return jsonify({"status": "running", "app": "Dr Waris Anwar Aesthetics", "model": AI_MODEL})
 
-# ============================================================
-# RUN
-# ============================================================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
