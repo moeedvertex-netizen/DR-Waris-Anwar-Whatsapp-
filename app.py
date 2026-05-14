@@ -536,7 +536,7 @@ def handle_webhook():
                             send_whatsapp_message(
                                 phone,
                                 "Thank you for sharing that. For now I can only read text messages. "
-                                "Please type your query and I will be happy to help you.",
+                                "Please type your query and I will be happy to help you!",
                             )
     except Exception as e:
         logger.error(f"Webhook error: {e}")
