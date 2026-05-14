@@ -1,3 +1,7 @@
+import google.auth
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+
 import os
 import json
 import logging
@@ -203,13 +207,59 @@ def detect_appointment(conversation_history, phone):
             role = "Patient" if msg["role"] == "user" else "Receptionist"
             conv_text += f"{role}: {msg['content']}\n"
         
-        extraction_prompt = f"""Analyze this conversation. Was an appointment CONFIRMED with all details (name, service, date, time)?
-If YES return JSON: {{"appointment_booked": true, "customer_name": "...", "service": "...", "date": "YYYY-MM-DD", "time": "HH:MM"}}
-If NO return: {{"appointment_booked": false}}
-Return ONLY JSON.
 
-Conversation:
-{conv_text}"""
+        extraction_prompt = f"""Analyze this conversation. Was an appointment CONFIRMED with all details (name, service, date, time)?
+    If YES return JSON: {{"appointment_booked": true, "customer_name": "...", "service": "...", "date": "YYYY-MM-DD", "time": "HH:MM"}}
+    If NO return: {{"appointment_booked": false}}
+
+    IMPORTANT:
+    - If the date is described as 'tomorrow', return the actual date in YYYY-MM-DD format (e.g., '{(datetime.utcnow() + timedelta(days=1)).strftime('%Y-%m-%d')}').
+    - If the date is described as 'today', return today's date in YYYY-MM-DD format (e.g., '{datetime.utcnow().strftime('%Y-%m-%d')}').
+    - Never return 'YYYY-MM-DD' as the date. Always return a real date.
+    - Time must be in 24-hour format (HH:MM).
+    - Return ONLY JSON, nothing else.
+
+    Conversation:
+    {conv_text}"""
+        def create_calendar_event(name, phone, service_name, date_str, time_str):
+            if not os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON") or not os.environ.get("GOOGLE_CALENDAR_ID"):
+                logger.warning("Google Calendar not configured, skipping event creation.")
+                return None
+            try:
+                creds_dict = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
+                creds = service_account.Credentials.from_service_account_info(
+                    creds_dict,
+                    scopes=["https://www.googleapis.com/auth/calendar"]
+                )
+                service = build("calendar", "v3", credentials=creds)
+                start_dt = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
+                end_dt = start_dt + timedelta(hours=1)
+                event = {
+                    "summary": f"{service_name} - {name}",
+                    "description": f"Patient: {name}\nPhone: {phone}\nService: {service_name}\nBooked via WhatsApp AI Agent",
+                    "start": {
+                        "dateTime": start_dt.strftime("%Y-%m-%dT%H:%M:%S"),
+                        "timeZone": "Asia/Karachi"
+                    },
+                    "end": {
+                        "dateTime": end_dt.strftime("%Y-%m-%dT%H:%M:%S"),
+                        "timeZone": "Asia/Karachi"
+                    },
+                    "location": "24-P Gulberg 2, Lahore",
+                    "reminders": {
+                        "useDefault": False,
+                        "overrides": [
+                            {"method": "popup", "minutes": 60},
+                            {"method": "popup", "minutes": 15}
+                        ]
+                    }
+                }
+                created = service.events().insert(calendarId=os.environ["GOOGLE_CALENDAR_ID"], body=event).execute()
+                logger.info(f"Calendar event created: {created.get('id')}")
+                return created.get("id")
+            except Exception as e:
+                logger.error(f"Calendar create error: {e}")
+                return None
 
         result_text = call_openrouter(
             [{"role": "user", "content": extraction_prompt}],
@@ -225,6 +275,14 @@ Conversation:
                     conv = supabase.table("conversations").select("id").eq("customer_phone", phone).execute()
                     if conv.data:
                         conv_id = conv.data[0]["id"]
+                    # Create Google Calendar event
+                    google_event_id = create_calendar_event(
+                        result.get("customer_name", ""),
+                        phone,
+                        result.get("service", ""),
+                        result.get("date", ""),
+                        result.get("time", "")
+                    )
                     supabase.table("appointments").insert({
                         "conversation_id": conv_id,
                         "customer_name": result.get("customer_name", ""),
@@ -232,7 +290,8 @@ Conversation:
                         "service": result.get("service", ""),
                         "appointment_date": result.get("date", ""),
                         "appointment_time": result.get("time", ""),
-                        "status": "confirmed"
+                        "status": "confirmed",
+                        "google_event_id": google_event_id
                     }).execute()
     except Exception as e:
         logger.error(f"Appointment detection error: {e}")
