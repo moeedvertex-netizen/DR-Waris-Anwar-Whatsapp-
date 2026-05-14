@@ -23,7 +23,7 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 AI_MODEL = os.environ.get("AI_MODEL", "openrouter/free")
 GOOGLE_CALENDAR_ID = os.environ.get("GOOGLE_CALENDAR_ID", "primary")
-GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON")  # Full JSON string as env var
+GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")  # Full JSON string as env var
 
 supabase = None
 if SUPABASE_URL and SUPABASE_KEY:
@@ -37,8 +37,8 @@ def get_calendar_service():
     try:
         scopes = ["https://www.googleapis.com/auth/calendar"]
 
-        if GOOGLE_CREDENTIALS_JSON:
-            creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
+        if GOOGLE_SERVICE_ACCOUNT_JSON:
+            creds_dict = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
         else:
             creds_path = os.path.join(os.path.dirname(__file__), "google_credentials.json")
             with open(creds_path) as f:
