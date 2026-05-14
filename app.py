@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+import threading
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 import requests as http_requests
@@ -36,7 +37,6 @@ def get_calendar_service():
     try:
         scopes = ["https://www.googleapis.com/auth/calendar"]
 
-        # Prefer env var (Railway secret), fall back to file on disk
         if GOOGLE_CREDENTIALS_JSON:
             creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
         else:
@@ -46,6 +46,7 @@ def get_calendar_service():
 
         creds = service_account.Credentials.from_service_account_info(creds_dict, scopes=scopes)
         service = build("calendar", "v3", credentials=creds)
+        logger.info("Google Calendar service built successfully")
         return service
     except Exception as e:
         logger.error(f"Google Calendar init error: {e}")
@@ -60,13 +61,13 @@ def add_to_google_calendar(customer_name, phone, service_name, apt_date, apt_tim
     Returns the created event dict, or None on failure.
     """
     try:
+        logger.info(f"Attempting Google Calendar insert: {customer_name} on {apt_date} at {apt_time}")
         cal = get_calendar_service()
         if not cal:
+            logger.error("Google Calendar service is None — check credentials env var")
             return None
 
-        # Build start datetime in Lahore timezone (PKT = UTC+5)
         start_str = f"{apt_date}T{apt_time}:00"
-        # Appointments are 1 hour by default
         start_dt = datetime.strptime(start_str, "%Y-%m-%dT%H:%M:%S")
         end_dt = start_dt + timedelta(hours=1)
         end_str = end_dt.strftime("%Y-%m-%dT%H:%M:%S")
@@ -101,7 +102,7 @@ def add_to_google_calendar(customer_name, phone, service_name, apt_date, apt_tim
         logger.info(f"Google Calendar event created: {created.get('htmlLink')}")
         return created
     except Exception as e:
-        logger.error(f"Google Calendar insert error: {e}")
+        logger.error(f"Google Calendar insert error: {e}", exc_info=True)
         return None
 
 # ── System prompt ────────────────────────────────────────────────────────────
@@ -248,14 +249,16 @@ def call_openrouter(messages, max_tokens=500, temperature=0.7):
                     "max_tokens": max_tokens,
                     "temperature": temperature,
                 },
-                timeout=30,
+                timeout=25,  # slightly under Gunicorn's 30s worker timeout
             )
             data = response.json()
             if "choices" in data and len(data["choices"]) > 0:
-                text = data["choices"][0]["message"]["content"].strip()
-                if text:
-                    logger.info(f"AI response from {model}: {text[:80]}...")
-                    return text
+                content = data["choices"][0]["message"]["content"]
+                if content:
+                    text = content.strip()
+                    if text:
+                        logger.info(f"AI response from {model}: {text[:80]}...")
+                        return text
             if "error" in data:
                 logger.warning(f"Model {model} error: {data['error']}")
         except Exception as e:
@@ -293,13 +296,22 @@ def get_ai_response(phone, message_text, sender_name):
 
     save_message_to_db(phone, sender_name, message_text, "customer")
     save_message_to_db(phone, None, ai_text, "ai_agent")
-    detect_appointment(history, phone)
+
+    # ── Run appointment detection in background so webhook returns fast ──
+    history_snapshot = list(history)  # copy to avoid race conditions
+    thread = threading.Thread(
+        target=detect_appointment,
+        args=(history_snapshot, phone),
+        daemon=True
+    )
+    thread.start()
 
     return ai_text
 
 # ── Appointment detection + Google Calendar ──────────────────────────────────
 
 def detect_appointment(conversation_history, phone):
+    """Runs in a background thread — detects confirmed appointments and saves them."""
     try:
         last_messages = (
             conversation_history[-10:] if len(conversation_history) > 10 else conversation_history
@@ -324,7 +336,7 @@ IMPORTANT:
 - "today" means {today}
 - Date MUST be actual date like {tomorrow}, NOT "YYYY-MM-DD"
 - Time MUST be in 24hr format like "14:00"
-- Return ONLY valid JSON
+- Return ONLY valid JSON, no extra text, no markdown code fences
 
 Conversation:
 {conv_text}"""
@@ -334,27 +346,48 @@ Conversation:
             max_tokens=200,
             temperature=0.1,
         )
+
         if not result_text:
+            logger.warning("Appointment detection: no response from OpenRouter")
             return
 
-        result_text = result_text.replace("```json", "").replace("```", "").strip()
-        result = json.loads(result_text)
+        # Strip markdown fences if present
+        result_text = result_text.strip()
+        if result_text.startswith("```"):
+            lines = result_text.split("\n")
+            # remove first and last lines (``` fences)
+            result_text = "\n".join(lines[1:-1]).strip()
+
+        # Find the JSON object inside the response text (in case model adds commentary)
+        import re
+        json_match = re.search(r'\{.*\}', result_text, re.DOTALL)
+        if not json_match:
+            logger.warning(f"No JSON found in appointment detection response: {result_text[:200]}")
+            return
+
+        result = json.loads(json_match.group())
 
         if not result.get("appointment_booked"):
+            logger.info("Appointment detection: no confirmed appointment found")
             return
 
         apt_date = result.get("date", "")
         apt_time = result.get("time", "")
 
         # Skip if date is still a placeholder or malformed
-        if "YYYY" in apt_date or not apt_date or len(apt_date) != 10:
-            logger.warning(f"Invalid date format: {apt_date}, skipping save")
+        if not apt_date or len(apt_date) != 10 or "YYYY" in apt_date or "MM" in apt_date:
+            logger.warning(f"Invalid date format detected: '{apt_date}' — skipping save")
+            return
+
+        # Validate time format HH:MM
+        if not apt_time or len(apt_time) < 4 or ":" not in apt_time:
+            logger.warning(f"Invalid time format detected: '{apt_time}' — skipping save")
             return
 
         customer_name = result.get("customer_name", "Unknown")
         service_name = result.get("service", "Consultation")
 
-        logger.info(f"Appointment detected: {result}")
+        logger.info(f"Appointment confirmed: {customer_name} | {service_name} | {apt_date} {apt_time}")
 
         # ── Save to Supabase ───────────────────────────────────────────────
         conv_id = None
@@ -364,7 +397,7 @@ Conversation:
                 if conv.data:
                     conv_id = conv.data[0]["id"]
 
-                # Avoid duplicate appointments (same phone + date + time)
+                # Avoid duplicate appointments
                 existing = (
                     supabase.table("appointments")
                     .select("id")
@@ -374,7 +407,7 @@ Conversation:
                     .execute()
                 )
                 if existing.data:
-                    logger.info("Appointment already exists in DB, skipping duplicate insert.")
+                    logger.info("Appointment already exists in Supabase — skipping duplicate")
                 else:
                     supabase.table("appointments").insert({
                         "conversation_id": conv_id,
@@ -394,10 +427,12 @@ Conversation:
         if event:
             logger.info(f"Google Calendar event created for {customer_name}: {event.get('htmlLink')}")
         else:
-            logger.warning(f"Google Calendar event NOT created for {customer_name}")
+            logger.error(f"Google Calendar event FAILED for {customer_name} on {apt_date} at {apt_time}")
 
+    except json.JSONDecodeError as e:
+        logger.error(f"Appointment detection JSON parse error: {e} | Raw text: {result_text[:300] if 'result_text' in dir() else 'N/A'}")
     except Exception as e:
-        logger.error(f"Appointment detection error: {e}")
+        logger.error(f"Appointment detection error: {e}", exc_info=True)
 
 # ── WhatsApp ─────────────────────────────────────────────────────────────────
 
