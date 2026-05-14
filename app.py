@@ -8,7 +8,10 @@ import requests
 from supabase import create_client
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+
+# AI Providers
 import google.generativeai as genai
+import openai
 
 # ============================================================
 # CONFIGURATION
@@ -17,11 +20,14 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
 # Environment Variables
 WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID")
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "drwaris_verify_token_2026")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
+AI_PROVIDER = os.environ.get("AI_PROVIDER", "gemini").lower()
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 GOOGLE_CALENDAR_ID = os.environ.get("GOOGLE_CALENDAR_ID")
@@ -33,9 +39,18 @@ if SUPABASE_URL and SUPABASE_KEY:
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
     logger.info("Supabase connected")
 
-# Initialize Gemini
-genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel("gemini-2.0-flash")
+
+# Initialize AI Provider
+if AI_PROVIDER == "gemini":
+    genai.configure(api_key=GEMINI_API_KEY)
+    model = genai.GenerativeModel("gemini-2.0-flash")
+elif AI_PROVIDER == "openrouter":
+    openai.api_key = OPENROUTER_API_KEY
+    openai.base_url = "https://openrouter.ai/api/v1"
+    # You can change the model below to any OpenRouter-supported model
+    OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "mistralai/mistral-large-v2")
+else:
+    raise Exception("Invalid AI_PROVIDER. Use 'gemini' or 'openrouter'.")
 
 # ============================================================
 # SYSTEM PROMPT - DR. WARIS ANWAR AESTHETICS
@@ -329,65 +344,62 @@ IMPORTANT:
 # GEMINI AI RESPONSE
 # ============================================================
 def get_ai_response(phone, message_text, sender_name):
-    """Get AI response from Gemini"""
+    """Get AI response from Gemini or OpenRouter"""
     history = get_conversation_history(phone)
-    
     # Add user message to history
     history.append({"role": "user", "parts": [message_text]})
-    
+
     try:
-        chat = model.start_chat(history=history[:-1])
-        
-        # Build context with system prompt
-        full_prompt = message_text
-        if len(history) <= 1:
-            full_prompt = f"[System: {SYSTEM_PROMPT}]\n\nPatient says: {message_text}"
-        
-        response = chat.send_message(
-            full_prompt,
-            generation_config=genai.types.GenerationConfig(
-                temperature=0.7,
-                max_output_tokens=500
+        if AI_PROVIDER == "gemini":
+            chat = model.start_chat(history=history[:-1])
+            full_prompt = message_text
+            if len(history) <= 1:
+                full_prompt = f"[System: {SYSTEM_PROMPT}]\n\nPatient says: {message_text}"
+            response = chat.send_message(
+                full_prompt,
+                generation_config=genai.types.GenerationConfig(
+                    temperature=0.7,
+                    max_output_tokens=500
+                )
             )
-        )
-        
-        ai_text = response.text.strip()
-        
+            ai_text = response.text.strip()
+        elif AI_PROVIDER == "openrouter":
+            # OpenRouter expects history as [{'role': 'user'/'assistant', 'content': ...}]
+            or_history = []
+            for msg in history:
+                role = "user" if msg["role"] == "user" else "assistant"
+                or_history.append({"role": role, "content": msg["parts"][0]})
+            or_history.append({"role": "user", "content": message_text})
+            system_prompt = SYSTEM_PROMPT
+            completion = openai.chat.completions.create(
+                model=OPENROUTER_MODEL,
+                messages=[{"role": "system", "content": system_prompt}] + or_history,
+                max_tokens=500,
+                temperature=0.7
+            )
+            ai_text = completion.choices[0].message.content.strip()
+        else:
+            raise Exception("Invalid AI_PROVIDER")
+
         # Add AI response to history
         history.append({"role": "model", "parts": [ai_text]})
         conversations[phone] = history
-        
+
         # Keep history manageable
         if len(conversations[phone]) > 40:
             conversations[phone] = conversations[phone][-30:]
-        
+
         # Save to database
         save_message_to_db(phone, sender_name, message_text, "customer")
         save_message_to_db(phone, None, ai_text, "ai_agent")
-        
+
         # Check for appointment
         detect_appointment(history, phone)
-        
+
         return ai_text
     except Exception as e:
-        logger.error(f"Gemini error: {e}")
-        
-        # Fallback with fresh chat
-        try:
-            response = model.generate_content(
-                f"{SYSTEM_PROMPT}\n\nPatient says: {message_text}\n\nReply as the receptionist:"
-            )
-            ai_text = response.text.strip()
-            history.append({"role": "model", "parts": [ai_text]})
-            conversations[phone] = history
-            
-            save_message_to_db(phone, sender_name, message_text, "customer")
-            save_message_to_db(phone, None, ai_text, "ai_agent")
-            
-            return ai_text
-        except Exception as e2:
-            logger.error(f"Gemini fallback error: {e2}")
-            return "Thank you for reaching out. Our team will get back to you shortly. You can also call us at our clinic number."
+        logger.error(f"AI error: {e}")
+        return "Thank you for reaching out. Our team will get back to you shortly. You can also call us at our clinic number."
 
 # ============================================================
 # WHATSAPP API
